@@ -1,5 +1,6 @@
 <#
-  LiteMonitor - Bluetooth Battery Service (v2.0)
+  LiteMonitor - Bluetooth Battery Service (v2.1)
+  v2.1: de-duplicate same-named devices (one row per device name).
 
   Two-process design (fixes "slow scan -> HTTP timeout -> X card"):
     -Scanner : background loop scanning BT battery levels into snapshot.json
@@ -65,15 +66,15 @@ function Read-Level($char, $mode) {
     return -1
 }
 
-function New-Device($name, $mac, $level, $state) {
-    return [pscustomobject]@{ name = [string]$name; mac = [string]$mac; level = [int]$level; state = [string]$state }
+function New-Device($name, $mac, $level, $state, $live = $false) {
+    return [pscustomobject]@{ name = [string]$name; mac = [string]$mac; level = [int]$level; state = [string]$state; live = [bool]$live }
 }
 
 function Read-Device($mac) {
     try {
         $addr = [Convert]::ToUInt64($mac, 16)
         $dev = AwaitOp ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($addr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice]) 3000
-        if ($null -eq $dev) { return New-Device $mac $mac -1 'offline' }
+        if ($null -eq $dev) { return New-Device $mac $mac -1 'offline' $false }
         $name = $dev.Name
         if ([string]::IsNullOrWhiteSpace($name)) { $name = $mac }
         # Connected -> read live (Uncached). Disconnected -> read last cached level (no forced reconnect, no battery drain).
@@ -82,7 +83,7 @@ function Read-Device($mac) {
         $sr = AwaitOp ($dev.GetGattServicesForUuidAsync($BATTERY_SERVICE)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult]) 4000
         if ($null -eq $sr -or $sr.Services.Count -eq 0) {
             $dev.Dispose()
-            return New-Device $name $mac -1 'offline'
+            return New-Device $name $mac -1 'offline' $connected
         }
         $level = -1
         foreach ($svc in $sr.Services) {
@@ -95,10 +96,10 @@ function Read-Device($mac) {
             if ($level -ge 0) { break }
         }
         $dev.Dispose()
-        if ($level -lt 0) { return New-Device $name $mac -1 'offline' }
-        return New-Device $name $mac $level 'ok'
+        if ($level -lt 0) { return New-Device $name $mac -1 'offline' $connected }
+        return New-Device $name $mac $level 'ok' $connected
     } catch {
-        return New-Device $mac $mac -1 'offline'
+        return New-Device $mac $mac -1 'offline' $false
     }
 }
 
@@ -114,7 +115,36 @@ function Get-Snapshot {
         $seen[$mac] = $true
         $list.Add((Read-Device $mac))
     }
-    return $list
+
+    # De-duplicate by device NAME: same-named entries collapse to a single row.
+    # (A device can be paired twice / show up with two addresses under one name.)
+    # Keep the most representative one: currently-connected (live) first, then an
+    # 'ok' reading, then the higher level. First-seen order is preserved.
+    $order = New-Object System.Collections.Generic.List[string]
+    $best = @{}
+    foreach ($dev in $list) {
+        $k = ([string]$dev.name).Trim()
+        if ([string]::IsNullOrWhiteSpace($k)) { $k = [string]$dev.mac }
+        if (-not $best.ContainsKey($k)) {
+            $best[$k] = $dev
+            $order.Add($k)
+            continue
+        }
+        $cur = $best[$k]
+        $take = $false
+        if ($dev.live -and -not $cur.live) {
+            $take = $true
+        } elseif ([bool]$dev.live -eq [bool]$cur.live) {
+            $devOk = ($dev.state -eq 'ok')
+            $curOk = ($cur.state -eq 'ok')
+            if ($devOk -and -not $curOk) { $take = $true }
+            elseif ($devOk -eq $curOk -and [int]$dev.level -gt [int]$cur.level) { $take = $true }
+        }
+        if ($take) { $best[$k] = $dev }
+    }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $order) { $out.Add($best[$k]) }
+    return $out
 }
 
 function Write-Snapshot($snap) {
