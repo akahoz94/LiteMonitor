@@ -1,5 +1,9 @@
 <#
-  LiteMonitor - Bluetooth Battery Service (v2.1)
+  LiteMonitor - Bluetooth Battery Service (v2.2)
+  v2.2: ONLY report devices that are CURRENTLY CONNECTED and readable.
+        (v2.1 read cached levels for disconnected devices, which flooded the
+         panel with stale rows - e.g. one device paired under two addresses
+         showing 100% and 33% side by side.)
   v2.1: de-duplicate same-named devices (one row per device name).
 
   Two-process design (fixes "slow scan -> HTTP timeout -> X card"):
@@ -113,7 +117,11 @@ function Get-Snapshot {
         $mac = $Matches[1]
         if ($seen.ContainsKey($mac)) { continue }
         $seen[$mac] = $true
-        $list.Add((Read-Device $mac))
+        $dev = Read-Device $mac
+        # v2.2: keep ONLY devices that are connected right now and readable.
+        # A disconnected device is simply not reported - its battery value would
+        # be a stale cache anyway.
+        if ($null -ne $dev -and $dev.live -and $dev.state -eq 'ok') { $list.Add($dev) }
     }
 
     # De-duplicate by device NAME: same-named entries collapse to a single row.
@@ -187,14 +195,28 @@ function Make-Json($payload, [int]$warn) {
     return ($o | ConvertTo-Json -Compress)
 }
 
-function Ensure-Scanner {
-    $procs = Get-CimInstance Win32_Process -Filter "name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*BluetoothBattery.ps1*' -and $_.CommandLine -like '*-Scanner*' }
-    if (@($procs).Count -gt 0) { return }
-    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    # NOTE: quote the script path - it contains a space
-    $arg = '-NoProfile -MTA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scanner -ScanInterval ' + $ScanInterval
-    Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList $arg
+function Ensure-Supervisors {
+    # One query for both children. The scanner and the watchdog now watch EACH
+    # OTHER: if either one dies, the other brings it back within seconds, so a
+    # single death can no longer take the whole service down.
+    $ps = Get-CimInstance Win32_Process -Filter "name='powershell.exe'" -ErrorAction SilentlyContinue
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+    $hasScanner = @($ps | Where-Object { $_.CommandLine -like '*BluetoothBattery.ps1*' -and $_.CommandLine -like '*-Scanner*' }).Count -gt 0
+    if (-not $hasScanner) {
+        # NOTE: quote the script path - it contains a space
+        $arg = '-NoProfile -MTA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scanner -ScanInterval ' + $ScanInterval
+        try { Start-Process -FilePath $psExe -WindowStyle Hidden -ArgumentList $arg } catch { }
+    }
+
+    $hasWd = @($ps | Where-Object { $_.CommandLine -like '*run-service.ps1*' }).Count -gt 0
+    if (-not $hasWd) {
+        $wd = Join-Path $env:LOCALAPPDATA 'LiteMonitorBtBattery\run-service.ps1'
+        if (Test-Path $wd) {
+            $arg2 = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $wd + '"'
+            try { Start-Process -FilePath $psExe -WindowStyle Hidden -ArgumentList $arg2 } catch { }
+        }
+    }
 }
 
 # ---------------- mode dispatch ----------------
@@ -223,7 +245,7 @@ if (-not $Serve) {
     exit 0
 }
 
-try { Ensure-Scanner } catch { }
+try { Ensure-Supervisors } catch { }
 
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://127.0.0.1:$Port/")
@@ -244,7 +266,7 @@ while ($true) {
     }
     $res = $ctx.Response
     try {
-        Ensure-Scanner
+        Ensure-Supervisors
         $q = $ctx.Request.Url.Query
         $warn = 20
         if ($q -match '[?&]warn=([^&]*)') { [void][int]::TryParse([System.Uri]::UnescapeDataString($Matches[1]), [ref]$warn) }
