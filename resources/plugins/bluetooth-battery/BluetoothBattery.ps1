@@ -118,10 +118,13 @@ function Get-Snapshot {
         if ($seen.ContainsKey($mac)) { continue }
         $seen[$mac] = $true
         $dev = Read-Device $mac
-        # v2.2: keep ONLY devices that are connected right now and readable.
-        # A disconnected device is simply not reported - its battery value would
-        # be a stale cache anyway.
-        if ($null -ne $dev -and $dev.live -and $dev.state -eq 'ok') { $list.Add($dev) }
+        # v2.3: report every device Windows can give us a battery level for.
+        # The old v2.2 rule required ConnectionStatus == Connected, but BLE
+        # devices do NOT hold a GATT connection while idle - so that filter
+        # hid every real device (panel showed only the HID++ mouse).
+        # A device only lands here when a level was actually read; devices
+        # that are gone fail the read and are dropped.
+        if ($null -ne $dev -and $dev.state -eq 'ok') { $list.Add($dev) }
     }
 
     # De-duplicate by device NAME: same-named entries collapse to a single row.
